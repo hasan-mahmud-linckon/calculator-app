@@ -28,8 +28,8 @@ WORKDIR /app
 COPY --from=builder /app/target/*.jar app.jar
 
 # Run as non-root user for security
-RUN useradd -m appuser && chown -R spring:spring /app
-USER appuser
+RUN useradd -m spring && chown -R spring:spring /app
+USER spring
 
 # Expose application port
 EXPOSE 8080
