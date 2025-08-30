@@ -1,0 +1,231 @@
+# .github/workflows/production-deploy.yml
+name: Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: linckon/calculator-app
+  
+jobs:
+  deploy-production:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Run unit tests
+      run: mvn test
+      
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        
+    - name: Push to Docker Hub
+      run: |
+        echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+    - name: Deploy to production EC2
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_PROD_PRIVATE_KEY }}" > ~/.ssh/prod_key
+        chmod 600 ~/.ssh/prod_key
+        
+        # Deploy to all production servers
+        IFS=',' read -ra SERVERS <<< "${{ secrets.EC2_PROD_HOSTS }}"
+        
+        # Get current image for rollback from first server
+        CURRENT_IMAGE=$(ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@${SERVERS[0]} \
+          "docker ps --format '{{.Image}}' | grep ${{ env.IMAGE_NAME }} | head -1" || echo "none")
+        echo "CURRENT_IMAGE=$CURRENT_IMAGE" >> $GITHUB_ENV
+        
+        for server in "${SERVERS[@]}"; do
+          echo "Deploying to $server..."
+          ssh-keyscan -H "$server" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@$server << 'EOF'
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            docker stop myapp-prod || true
+            docker rm myapp-prod || true
+            docker run -d --name myapp-prod --restart unless-stopped -p 8080:8080 \
+              -e SPRING_PROFILES_ACTIVE=production \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        EOF
+        done
+        
+    - name: Run smoke tests
+      id: smoke-tests
+      run: |
+        sleep 90
+        IFS=',' read -ra SERVERS <<< "${{ secrets.EC2_PROD_HOSTS }}"
+        
+        for server in "${SERVERS[@]}"; do
+          echo "Testing $server..."
+          for i in {1..10}; do
+            if curl -f http://$server:8080/health; then
+              echo "Health check passed for $server"
+              break
+            fi
+            if [ $i -eq 10 ]; then
+              echo "Health check failed for $server"
+              echo "smoke_tests_status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            sleep 10
+          done
+        done
+        echo "smoke_tests_status=success" >> $GITHUB_OUTPUT
+        
+    - name: Rollback on failure
+      if: failure() && env.CURRENT_IMAGE != 'none'
+      id: rollback
+      run: |
+        echo "🔄 Starting production rollback to: ${{ env.CURRENT_IMAGE }}"
+        IFS=',' read -ra SERVERS <<< "${{ secrets.EC2_PROD_HOSTS }}"
+        
+        ROLLBACK_SUCCESS=true
+        
+        for server in "${SERVERS[@]}"; do
+          echo "Rolling back $server..."
+          ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@$server << EOF
+            echo "Stopping failed container on $server..."
+            docker stop myapp-prod || true
+            docker rm myapp-prod || true
+            
+            echo "Starting previous version on $server..."
+            docker run -d --name myapp-prod --restart unless-stopped -p 8080:8080 \
+              -e SPRING_PROFILES_ACTIVE=production \
+              -e ROLLBACK_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              -e ROLLBACK_FROM="${{ github.sha }}" \
+              ${{ env.CURRENT_IMAGE }}
+        EOF
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Rollback failed on $server"
+            ROLLBACK_SUCCESS=false
+          fi
+        done
+        
+        if [ "$ROLLBACK_SUCCESS" = true ]; then
+          echo "rollback_status=success" >> $GITHUB_OUTPUT
+          echo "✅ Rollback completed on all servers"
+        else
+          echo "rollback_status=failed" >> $GITHUB_OUTPUT
+          echo "❌ Rollback failed on one or more servers"
+          exit 1
+        fi
+
+    - name: Notify rollback to Discord
+      if: failure() && steps.rollback.outputs.rollback_status == 'success'
+      run: |
+        curl -H "Content-Type: application/json" -X POST \
+          -d "{
+            \"embeds\": [{
+              \"title\": \"🚨 Production Rollback Executed\",
+              \"description\": \"Production deployment failed and rollback was triggered\",
+              \"color\": 16776960,
+              \"fields\": [
+                {\"name\": \"Environment\", \"value\": \"🚨 PRODUCTION\", \"inline\": true},
+                {\"name\": \"Failed Commit\", \"value\": \"${{ github.sha }}\", \"inline\": true},
+                {\"name\": \"Rolled Back To\", \"value\": \"${{ env.CURRENT_IMAGE }}\", \"inline\": false},
+                {\"name\": \"Servers\", \"value\": \"${{ secrets.EC2_PROD_HOSTS }}\", \"inline\": false},
+                {\"name\": \"Trigger\", \"value\": \"Smoke tests failed\", \"inline\": true}
+              ],
+              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }]
+          }" \
+          ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    - name: Verify rollback with smoke tests
+      if: failure() && steps.rollback.outputs.rollback_status == 'success'
+      id: rollback-verification
+      run: |
+        echo "🧪 Verifying production rollback with smoke tests..."
+        sleep 60
+        IFS=',' read -ra SERVERS <<< "${{ secrets.EC2_PROD_HOSTS }}"
+        
+        VERIFICATION_SUCCESS=true
+        
+        for server in "${SERVERS[@]}"; do
+          echo "Verifying rollback on $server..."
+          
+          for i in {1..8}; do
+            if curl -f http://$server:8080/health; then
+              echo "✅ Rollback verification successful for $server"
+              break
+            fi
+            if [ $i -eq 8 ]; then
+              echo "❌ Rollback verification failed for $server"
+              VERIFICATION_SUCCESS=false
+            fi
+            sleep 10
+          done
+        done
+        
+        if [ "$VERIFICATION_SUCCESS" = true ]; then
+          echo "rollback_verification=success" >> $GITHUB_OUTPUT
+          echo "✅ All production servers are healthy after rollback"
+          
+          # Send success notification
+          curl -H "Content-Type: application/json" -X POST \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"✅ Production Rollback Verified\",
+                \"description\": \"Rollback completed and all servers are healthy\",
+                \"color\": 65280,
+                \"fields\": [
+                  {\"name\": \"Environment\", \"value\": \"🚀 PRODUCTION\", \"inline\": true},
+                  {\"name\": \"Status\", \"value\": \"✅ All Servers Healthy\", \"inline\": true},
+                  {\"name\": \"Running Version\", \"value\": \"${{ env.CURRENT_IMAGE }}\", \"inline\": false},
+                  {\"name\": \"Servers\", \"value\": \"${{ secrets.EC2_PROD_HOSTS }}\", \"inline\": false}
+                ],
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }]
+            }" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+        else
+          echo "rollback_verification=failed" >> $GITHUB_OUTPUT
+          echo "❌ One or more production servers failed rollback verification"
+          
+          # Send failure notification
+          curl -H "Content-Type: application/json" -X POST \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"🚨 Production Rollback Verification Failed\",
+                \"description\": \"Rollback completed but some servers are still unhealthy\",
+                \"color\": 16711680,
+                \"fields\": [
+                  {\"name\": \"Environment\", \"value\": \"🚨 PRODUCTION\", \"inline\": true},
+                  {\"name\": \"Status\", \"value\": \"❌ Some Servers Unhealthy\", \"inline\": true},
+                  {\"name\": \"Action Required\", \"value\": \"🚨 IMMEDIATE MANUAL INTERVENTION NEEDED\", \"inline\": false},
+                  {\"name\": \"Servers\", \"value\": \"${{ secrets.EC2_PROD_HOSTS }}\", \"inline\": false}
+                ],
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }]
+            }" \
+            ${{ secrets.DISCORD_WEBHOOK_URL }}
+          exit 1
+        fi
+        
+    - name: Notify Discord
+      if: always() && steps.smoke-tests.outputs.smoke_tests_status == 'success'
+      run: |
+        curl -H "Content-Type: application/json" -X POST \
+          -d "{\"embeds\":[{\"title\":\"🚀 Production Deployment Successful\",\"description\":\"Deployed to production successfully\",\"color\":65280,\"fields\":[{\"name\":\"Commit\",\"value\":\"${{ github.sha }}\",\"inline\":true},{\"name\":\"Servers\",\"value\":\"${{ secrets.EC2_PROD_HOSTS }}\",\"inline\":true}]}]}" \
+          ${{ secrets.DISCORD_WEBHOOK_URL }}
+        
+    - name: Cleanup
+      if: always()
+      run: rm -f ~/.ssh/prod_key
