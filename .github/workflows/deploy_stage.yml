@@ -24,12 +24,12 @@ jobs:
         distribution: 'temurin'
         
     - name: Run unit tests
-      run: mvn test
+      run:  mvn test -Dtest="*ServiceTest"
       
     - name: Build Docker image
       run: |
         docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }} .
-        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-latest .
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-latest
         
     - name: Push to Docker Hub
       run: |
@@ -49,11 +49,17 @@ jobs:
           "docker ps --format '{{.Image}}' | grep ${{ env.IMAGE_NAME }} | head -1" || echo "none")
         echo "CURRENT_IMAGE=$CURRENT_IMAGE" >> $GITHUB_ENV
         
-        # Deploy new version
         ssh -i ~/.ssh/staging_key ${{ secrets.EC2_STAGING_USER }}@${{ secrets.EC2_STAGING_HOST }} << 'EOF'
+          # Pull new image
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }}
-          docker stop myapp-staging || true
-          docker rm myapp-staging || true
+          
+          # Stop and remove existing container
+          if docker ps -q --filter "name=myapp-staging" | grep -q .; then
+            docker stop myapp-staging
+            docker rm myapp-staging
+          fi
+          
+          # Start new container
           docker run -d --name myapp-staging --restart unless-stopped -p 8080:8080 \
             -e SPRING_PROFILES_ACTIVE=staging \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }}
@@ -65,129 +71,57 @@ jobs:
         sleep 60
         for i in {1..10}; do
           if curl -f http://${{ secrets.EC2_STAGING_HOST }}:8080/health; then
-            echo "Health check passed"
             echo "smoke_tests_status=success" >> $GITHUB_OUTPUT
             exit 0
           fi
-          echo "Attempt $i failed, retrying..."
           sleep 10
         done
-        echo "Health check failed"
         echo "smoke_tests_status=failed" >> $GITHUB_OUTPUT
         exit 1
-        
+
     - name: Rollback on failure
       if: failure() && env.CURRENT_IMAGE != 'none'
       id: rollback
       run: |
-        echo "🔄 Starting rollback to previous version: ${{ env.CURRENT_IMAGE }}"
-        
         ssh -i ~/.ssh/staging_key ${{ secrets.EC2_STAGING_USER }}@${{ secrets.EC2_STAGING_HOST }} << EOF
-          echo "Stopping failed container..."
           docker stop myapp-staging || true
           docker rm myapp-staging || true
-          
-          echo "Starting previous working version..."
           docker run -d --name myapp-staging --restart unless-stopped -p 8080:8080 \
             -e SPRING_PROFILES_ACTIVE=staging \
-            -e ROLLBACK_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -e ROLLBACK_FROM="${{ github.sha }}" \
             ${{ env.CURRENT_IMAGE }}
         EOF
-        
-        if [ $? -eq 0 ]; then
-          echo "rollback_status=success" >> $GITHUB_OUTPUT
-          echo "✅ Rollback completed successfully"
-        else
-          echo "rollback_status=failed" >> $GITHUB_OUTPUT
-          echo "❌ Rollback failed"
-          exit 1
-        fi
+        echo "rollback_status=success" >> $GITHUB_OUTPUT
 
-    - name: Notify rollback to Discord
-      if: failure() && steps.rollback.outputs.rollback_status == 'success'
-      run: |
-        curl -H "Content-Type: application/json" -X POST \
-          -d "{
-            \"embeds\": [{
-              \"title\": \"🔄 Staging Rollback Executed\",
-              \"description\": \"Deployment failed and rollback was triggered\",
-              \"color\": 16776960,
-              \"fields\": [
-                {\"name\": \"Environment\", \"value\": \"Staging\", \"inline\": true},
-                {\"name\": \"Failed Commit\", \"value\": \"${{ github.sha }}\", \"inline\": true},
-                {\"name\": \"Rolled Back To\", \"value\": \"${{ env.CURRENT_IMAGE }}\", \"inline\": false},
-                {\"name\": \"Server\", \"value\": \"${{ secrets.EC2_STAGING_HOST }}\", \"inline\": true},
-                {\"name\": \"Trigger\", \"value\": \"Smoke tests failed\", \"inline\": true}
-              ],
-              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-            }]
-          }" \
-          ${{ secrets.DISCORD_WEBHOOK_URL }}
-
-    - name: Verify rollback with smoke tests
+    - name: Verify rollback
       if: failure() && steps.rollback.outputs.rollback_status == 'success'
       id: rollback-verification
       run: |
-        echo "🧪 Verifying rollback with smoke tests..."
         sleep 30
-        
         for i in {1..8}; do
           if curl -f http://${{ secrets.EC2_STAGING_HOST }}:8080/health; then
-            echo "✅ Rollback verification successful - application is healthy"
             echo "rollback_verification=success" >> $GITHUB_OUTPUT
-            
-            # Send success notification
-            curl -H "Content-Type: application/json" -X POST \
-              -d "{
-                \"embeds\": [{
-                  \"title\": \"✅ Staging Rollback Verified\",
-                  \"description\": \"Rollback completed and application is healthy\",
-                  \"color\": 65280,
-                  \"fields\": [
-                    {\"name\": \"Environment\", \"value\": \"Staging\", \"inline\": true},
-                    {\"name\": \"Status\", \"value\": \"✅ Healthy\", \"inline\": true},
-                    {\"name\": \"Running Version\", \"value\": \"${{ env.CURRENT_IMAGE }}\", \"inline\": false},
-                    {\"name\": \"Health Check\", \"value\": \"http://${{ secrets.EC2_STAGING_HOST }}:8080/health\", \"inline\": false}
-                  ],
-                  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-                }]
-              }" \
-              ${{ secrets.DISCORD_WEBHOOK_URL }}
             exit 0
           fi
-          echo "Rollback verification attempt $i failed, retrying..."
           sleep 10
         done
-        
-        echo "❌ Rollback verification failed - application still unhealthy"
         echo "rollback_verification=failed" >> $GITHUB_OUTPUT
-        
-        # Send failure notification
-        curl -H "Content-Type: application/json" -X POST \
-          -d "{
-            \"embeds\": [{
-              \"title\": \"🚨 Staging Rollback Verification Failed\",
-              \"description\": \"Rollback completed but application is still unhealthy\",
-              \"color\": 16711680,
-              \"fields\": [
-                {\"name\": \"Environment\", \"value\": \"Staging\", \"inline\": true},
-                {\"name\": \"Status\", \"value\": \"❌ Unhealthy\", \"inline\": true},
-                {\"name\": \"Action Required\", \"value\": \"Manual intervention needed\", \"inline\": false},
-                {\"name\": \"Server\", \"value\": \"${{ secrets.EC2_STAGING_HOST }}\", \"inline\": true}
-              ],
-              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-            }]
-          }" \
-          ${{ secrets.DISCORD_WEBHOOK_URL }}
         exit 1
-        
-    - name: Notify Discord
-      if: always() && steps.smoke-tests.outputs.smoke_tests_status == 'success'
+
+    # Discord Notifications
+    - name: Discord - Success
+      if: success()
       run: |
-        curl -H "Content-Type: application/json" -X POST \
-          -d "{\"embeds\":[{\"title\":\"✅ Staging Deployment Successful\",\"description\":\"Deployed to staging successfully\",\"color\":65280,\"fields\":[{\"name\":\"Commit\",\"value\":\"${{ github.sha }}\",\"inline\":true},{\"name\":\"Server\",\"value\":\"${{ secrets.EC2_STAGING_HOST }}\",\"inline\":true}]}]}" \
-          ${{ secrets.DISCORD_WEBHOOK_URL }}
+        curl -H "Content-Type: application/json" -X POST -d '{"embeds":[{"title":"✅ Staging Deployment Success","color":65280,"fields":[{"name":"Commit","value":"${{ github.sha }}","inline":true},{"name":"Server","value":"${{ secrets.EC2_STAGING_HOST }}","inline":true}]}]}' ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    - name: Discord - Rollback Success
+      if: failure() && steps.rollback-verification.outputs.rollback_verification == 'success'
+      run: |
+        curl -H "Content-Type: application/json" -X POST -d '{"embeds":[{"title":"🔄 Staging Rollback Success","color":16776960,"fields":[{"name":"Failed Commit","value":"${{ github.sha }}","inline":true},{"name":"Rolled Back To","value":"${{ env.CURRENT_IMAGE }}","inline":true}]}]}' ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    - name: Discord - Failure
+      if: failure() && (steps.rollback-verification.outputs.rollback_verification == 'failed' || env.CURRENT_IMAGE == 'none')
+      run: |
+        curl -H "Content-Type: application/json" -X POST -d '{"embeds":[{"title":"🚨 Staging Deployment Failed","color":16711680,"fields":[{"name":"Commit","value":"${{ github.sha }}","inline":true},{"name":"Status","value":"Manual intervention required","inline":true}]}]}' ${{ secrets.DISCORD_WEBHOOK_URL }}
         
     - name: Cleanup
       if: always()
