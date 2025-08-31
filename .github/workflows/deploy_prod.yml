@@ -42,14 +42,14 @@ jobs:
         mkdir -p ~/.ssh
         echo "${{ secrets.EC2_PROD_PRIVATE_KEY }}" > ~/.ssh/prod_key
         chmod 600 ~/.ssh/prod_key
-        ssh-keyscan -H ${{ secrets.EC2_PROD_HOST }} >> ~/.ssh/known_hosts
+        ssh-keyscan -H ${{ secrets.EC2_PROD_HOSTS }} >> ~/.ssh/known_hosts
         
         # Get current image for rollback
-        CURRENT_IMAGE=$(ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@${{ secrets.EC2_PROD_HOST }} \
+        CURRENT_IMAGE=$(ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@${{ secrets.EC2_PROD_HOSTS }} \
           "docker ps --format '{{.Image}}' | grep ${{ env.IMAGE_NAME }} | head -1" || echo "none")
         echo "CURRENT_IMAGE=$CURRENT_IMAGE" >> $GITHUB_ENV
         
-        ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@${{ secrets.EC2_PROD_HOST }} << 'EOF'
+        ssh -i ~/.ssh/prod_key ${{ secrets.EC2_PROD_USER }}@${{ secrets.EC2_PROD_HOSTS }} << 'EOF'
           # Pull new image
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           
