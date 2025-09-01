@@ -1,6 +1,6 @@
 <div align="center">
 
-# Calculator App
+# MathOps
 
 </div>
 
@@ -10,7 +10,7 @@
 
 </div>
 
-A simple REST API calculator application built with Spring Boot that provides basic mathematical operations: addition, subtraction, and multiplication. This repository also includes a complete CI/CD pipeline using GitHub Actions to build, test, containerize, and deploy to staging and production EC2 instances with automated smoke tests, rollback, and Discord notifications.
+MathOps is a lightweight calculator API built with Spring Boot that provides basic mathematical operations: addition, subtraction, and multiplication. This repository also includes a complete CI/CD pipeline using GitHub Actions to build, test, containerize, and deploy to staging and production EC2 instances with automated smoke tests, rollback, and Discord notifications.
 
 ## Branching and Environments:
 
